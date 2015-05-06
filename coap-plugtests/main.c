@@ -31,7 +31,7 @@
 #include "coap_thread.h"
 #include "coap_handlers.h"
 
-#define ENABLE_DEBUG (0)
+#define ENABLE_DEBUG (1)
 #include "debug.h"
 
 #define MAC_PRIO                (PRIORITY_MAIN - 4)
@@ -39,7 +39,7 @@
 /**
  * @brief   Buffer size used by the shell
  */
-#define SHELL_BUFSIZE           (64U)
+#define SHELL_BUFSIZE           (128U)
 
 #ifndef NOMAC_STACK_SIZE
 #define NOMAC_STACK_SIZE (KERNEL_CONF_STACKSIZE_DEFAULT)
@@ -74,6 +74,7 @@ static void shell_put(int c)
     putchar((char)c);
 }
 
+
 /**
  * @brief  Central point of exit. Replace with something useful or hand
  *         hand back control.
@@ -88,6 +89,101 @@ static int error_with(char *msg, int status, int fatal)
         return status;
     }
 }
+
+/* Stolen from sc_ipv6_nc.c */
+static bool _is_iface(kernel_pid_t iface)
+{
+#ifdef MODULE_NG_NETIF
+    size_t numof;
+    kernel_pid_t *ifs = ng_netif_get(&numof);
+
+    for (size_t i = 0; i < numof; i++) {
+        if (ifs[i] == iface) {
+            return true;
+        }
+    }
+
+    return false;
+#else
+    return (thread_get(iface) != NULL);
+#endif
+}
+
+
+int udp_send(int argc, char **argv)
+{
+    ng_pktsnip_t *data_snip, *udp_snip, *ip_snip;
+    ng_ipv6_addr_t dest_addr;
+    ng_netreg_entry_t *sendto;
+    kernel_pid_t iface;
+    uint16_t src_port = 0;
+    uint16_t dst_port = 0;
+    int data_index = 4;
+    
+    if (argc < 5) {
+        puts("usage: udp_send <if_id> <ipv6_addr> <dst_port> [src_port] [data]");
+        puts("  (a numeric fourth argument will be interpreted as source port)");
+        return EINVAL;
+    }
+    
+    iface = (kernel_pid_t)atoi(argv[1]);
+
+    if (!_is_iface(iface)) {
+        puts("error: invalid interface given.");
+        return EINVAL;
+    }
+
+    if (!ng_ipv6_addr_from_str(&dest_addr, argv[2])) {
+        puts("error: invalid destination address given.");
+        return EINVAL;
+    }
+
+    dst_port = (uint16_t)atoi(argv[3]);
+
+    if ((argv[4][0] <= 0x39) && (argv[4][0] >= 0x30)) {
+        src_port = (uint16_t)atoi(argv[4]);
+        data_index++;
+    }
+    else {
+        prng((unsigned char *)&src_port, sizeof(uint16_t));
+    }
+    
+    printf("Interface(%u), IPv6(%s), UDP(%u -> %u): \"%s\"\n",
+           iface, argv[2], src_port, dst_port, argv[data_index]);
+    
+    data_snip = ng_pktbuf_add(NULL, argv[data_index], strlen(argv[data_index]),
+                              NG_NETTYPE_UNDEF);
+
+    udp_snip = ng_netreg_hdr_build(NG_NETTYPE_UDP, data_snip,
+                                   (uint8_t *)&src_port, sizeof(uint16_t),
+                                   (uint8_t *)&dst_port, sizeof(uint16_t));
+
+    ip_snip = ng_netreg_hdr_build(NG_NETTYPE_IPV6, udp_snip,
+                                  NULL, 0,
+                                  (uint8_t *)&dest_addr.u8, sizeof(ng_ipv6_addr_t));
+
+    /* and forward packet to the network layer */
+    sendto = ng_netreg_lookup(NG_NETTYPE_UDP, NG_NETREG_DEMUX_CTX_ALL);
+
+    /* throw away packet if no one is interested */
+    if (sendto == NULL) {
+        printf("netcat: cannot send packet because network layer not found\n");
+        ng_pktbuf_release(ip_snip);
+        return -1;
+    }
+
+    /* send packet to network layer */
+    ng_pktbuf_hold(ip_snip, ng_netreg_num(NG_NETTYPE_UDP, NG_NETREG_DEMUX_CTX_ALL) - 1);
+
+    while (sendto != NULL) {
+        ng_netapi_send(sendto->pid, ip_snip);
+        sendto = ng_netreg_getnext(sendto);
+    }
+
+    return 0;
+}
+
+
 
 /**
  * @brief   Setup a MAC-derived link-local, solicited-nodes and multicast address
@@ -166,6 +262,26 @@ static int init_ipv6_linklocal(kernel_pid_t net_if, uint8_t *mac)
                                   NG_IPV6_ADDR_MAX_STR_LEN));
     }
 
+#if defined(ULA_PREFIX) && defined(ULA_PREFIX_LENGTH)
+    /* Setup unique local address if defined */
+    ng_ipv6_addr_t ula_addr;
+    ng_ipv6_addr_from_str(&ula_addr, ULA_PREFIX);
+    ng_ipv6_addr_set_aiid(&ula_addr, &eui64[0]);
+    res = ng_ipv6_netif_add_addr(net_if, &ula_addr, ULA_PREFIX_LENGTH, 0);
+
+    if (res < 0) {
+        error_with("ULA initialization failed", res, 1);
+    }
+    else {
+        DEBUG("unicast address (ULA): %s\n",
+              ng_ipv6_addr_to_str(&addr_buf[0],
+                                  &ula_addr,
+                                  NG_IPV6_ADDR_MAX_STR_LEN));
+    }
+
+#else
+#pragma message("ULA_PREFIX or ULA_PREFIX_LENGTH not defined")
+#endif
     return 0;
 }
 
@@ -177,7 +293,6 @@ int main(void)
 {
     int res;
     shell_t shell;
-
     kernel_pid_t netif, coap;
     size_t num_netif;
 
@@ -214,83 +329,85 @@ int main(void)
             DEBUG("Successfully initialized link-local adresses on first interface\n");
         }
 
-#ifdef HOST_IP
-        ng_ipv6_addr_t global_addr;
-        ng_ipv6_addr_from_str(&global_addr, HOST_IP);
-        res = ng_ipv6_netif_add_addr(netif, &global_addr, 64, 0);
 
-        if (res < 0) {
-            error_with("global address initialization failed", res, 1);
-        }
-
-#else
-#pragma message("HOST_IP not defined")
-#endif
-
+        /* Setup neighbour cache while NDP is unavailable */
 #ifdef REMOTE_IP
-#ifdef REMOTE_MAC
-        char mac_buf[32];
         uint8_t remote_mac[6];
         ng_ipv6_addr_t remote_addr;
-        /* Setup neighbour cache while NDP is unavailable */
         ng_ipv6_addr_from_str(&remote_addr, REMOTE_IP);
+#ifdef REMOTE_MAC
+        char mac_buf[32];
+
 
         memcpy(&mac_buf, REMOTE_MAC, 18);
         ng_netif_addr_from_str(&remote_mac[0],
                                6,
                                &mac_buf[0]);
-
+#else   /* Derive the MAC from our own one. dev_eth_tap sets it plus 1
+         * the one it reads from the tap device */
+        memcpy(&remote_mac, &dev_eth_tap.addr, sizeof(remote_mac));
+        remote_mac[5] -= 1;
+#endif  /* REMOTE_MAC */
         res = ng_ipv6_nc_add(netif, &remote_addr, &remote_mac[0], 6, 0);
 
         if (res < 0) {
             error_with("setup of neighbour cache failed", res, 0);
         }
 
-#else
-#error "No REMOTE_MAC for REMOTE_IP defined"
-#endif  /* REMOTE_MAC */
 #endif  /* REMOTE_IP */
     }
     else {
         error_with("no active interfaces", num_netif, 1);
     }
 
-    coap_endpoint_t ep;
-    coap_context_t ctx;
+    /* initialize and register pktdump */
+    ng_netreg_entry_t dump;
+    dump.pid = ng_pktdump_init();
+    dump.demux_ctx = NG_NETREG_DEMUX_CTX_ALL;
+
+    if (dump.pid <= KERNEL_PID_UNDEF) {
+        puts("Error starting pktdump thread");
+        return -1;
+    }
+
+    ng_netreg_register(NG_NETTYPE_IPV6, &dump);
+    
+    /* coap_endpoint_t ep; */
+    /* coap_context_t ctx; */
 
     /* Setup an endpoint for CoAP (::/5683) on netif */
-    coap_init_endpoint(&ep,
-                       ipv6_addr_any,
-                       COAP_DEFAULT_PORT,
-                       netif);
+    /* coap_init_endpoint(&ep, */
+    /*                    ipv6_addr_any, */
+    /*                    COAP_DEFAULT_PORT, */
+    /*                    netif); */
 
     /* You put that into a "context", libcoaps state struct */
-    coap_init_context(&ctx, &ep, 0);
+    /* coap_init_context(&ctx, &ep, 0); */
 
     /* Register handlers for resources */
-    register_handlers(&ctx);
+    /* register_handlers(&ctx); */
 
     /* Run it with with coap_run_context */
-    coap = thread_create(coap_stack, sizeof(coap_stack), COAP_PRIO,
-                         CREATE_STACKTEST, &coap_run_context, &ctx, "coap");
+    /* coap = thread_create(coap_stack, sizeof(coap_stack), COAP_PRIO, */
+    /*                      CREATE_STACKTEST, &coap_run_context, &ctx, "coap"); */
 
-    if (coap <= KERNEL_PID_UNDEF) {
-        error_with("starting coap thread failed", coap, 1);
-    }
+    /* if (coap <= KERNEL_PID_UNDEF) { */
+    /*     error_with("starting coap thread failed", coap, 1); */
+    /* } */
 
     /* now coap is running and you can't stop it gracefully */
 
     /* start the shell */
-    shell_init(&shell, NULL, SHELL_BUFSIZE, shell_read, shell_put);
+    const shell_command_t shell_commands[] = {
+        {"udp_send", "Send arbitrary UDP packets", udp_send},
+        {NULL, NULL, NULL}
+    };
+    
+    shell_init(&shell, shell_commands, SHELL_BUFSIZE, shell_read, shell_put);
     shell_run(&shell);
 
     return 0;
 }
-
-
-
-
-
 
 
 
